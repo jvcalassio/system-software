@@ -39,13 +39,43 @@ STOP
 You may compile and run it using the following command:
 
 ```
-g++ -o compiler src/montador.cpp
-./compiler examples/prog1.asm
+g++ -o assembler src/montador.cpp
+./assembler examples/prog1.asm
 ```
 
-The output for the code above should be the *prog1.obj* file, with the following content:
+The output for the code above should be the *prog1.obj* file to be used by the linker, with the following content:
 
-    12 11 10 11 1 12 11 11 13 11 14 0 5 
+```
+H examples/prog1
+S 13
+R 0101010101000
+T 12 11 
+T 10 11 
+T 1 12 
+T 11 11 
+T 13 11 
+T 14 
+T 0 
+T 5 
+```
+
+H = headers,
+S = code size,
+R = relocation data,
+T = text (code)
+
+## Linker and modularization
+
+In order to use different modules, you should use the *PUBLIC* and *EXTERN* directives inside the data section. It supports up to 3 different files simultaneously.
+
+As for the linker, it also receives up to 3 different object files, links them and generates a new object file named "firstfile_linked.obj", ready to be executed by the simulator.
+
+You may compile and run it using the following command:
+
+```
+g++ -o linker src/ligador.cpp
+./linker examples/prog1_linked.obj
+```
 
 ## Simulator
 
@@ -57,7 +87,7 @@ You may compile and run it using the following command:
 
 ```
 g++ -o simulator src/simulador.cpp
-./simulator examples/prog1.obj
+./simulator examples/prog1_linked.obj
 ```
 
 The output for the provided code and "5" as input should be:
@@ -83,4 +113,4 @@ PC : 11
 ACC : 10
 ```
 
-And it generates a new file called "prog1.out" if there's any output requested by the *OUTPUT* instruction. For the example code, the output is "10".
+And it generates a new file called "prog1_linnked.out" if there's any output requested by the *OUTPUT* instruction. For the example code, the output is "10".

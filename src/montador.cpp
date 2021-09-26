@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
+#include <sstream>
 
 using namespace std;
 
@@ -17,7 +18,9 @@ enum errors {
     ERROR_INEXISTENT_INSTRUCTION,
     ERROR_INVALID_OPERATOR_COUNT,
     ERROR_INVALID_OPERATOR_TYPE,
-    ERROR_INVALID_TOKEN
+    ERROR_INVALID_TOKEN,
+    ERROR_INVALID_MODULE,
+    ERROR_BOUNDARIES_SINGLE_FILE,
 };
 
 
@@ -41,12 +44,21 @@ map<string, pair<int,int>> instruction_table = {
 
 map<string, int> directives_table = {
     {"const", 1},
-    {"space", 1}
+    {"space", 1},
+    {"extern", 1},
+    {"public", 1}
 };
 
-map<string, int> symbol_table;
+// LABEL: [ valor, externo? ]
+// 0 = interno, 1 = externo
+map<string, pair<int,int>> symbol_table;
+map<string, pair<int,int>> def_table;
+vector<pair<string,int>> use_table;
+vector<int> reloc_info;
 
 int error_flag = 0; // flag de erro, se 1, nao gera arquivo objeto
+
+int module_count = 1; // contador de modulos
 
 
 /**
@@ -106,6 +118,12 @@ void throw_error(int error, int line, string params[]) {
     } else if(error == ERROR_INVALID_TOKEN) {
         type = 1;
         cause = "Token invalido (" + params[0] + ")";
+    } else if(error == ERROR_INVALID_MODULE) {
+        type = 1;
+        cause = "Modulo nao contem declaracao de limites (BEGIN, END).";
+    } else if(error == ERROR_BOUNDARIES_SINGLE_FILE) {
+        type = 1;
+        cause = "Declaracao de \"" + params[0] + "\" em arquivo unico (sem outros modulos).";
     }
 
     cout << "Erro " << types[type] << " na linha " << line << ":" << endl;
@@ -233,9 +251,11 @@ void first_pass(char* file_path) {
     int data_pos_counter = 0;
     int line_counter = 1;
 
-    map<string,int> temp_symbol_table;
+    map<string, pair<int,int>> temp_symbol_table;
 
-    int current_section = 0; // primeiro DATA, depois TEXT
+    int current_section = -1; // primeiro DATA, depois TEXT
+
+    int boundaries_defined[] = {0, 0}; // [ existe begin ? , existe end ? ]
 
     while(getline(file, line)) {
         // garante funcionamento em arquivos terminados com CRLF
@@ -245,7 +265,7 @@ void first_pass(char* file_path) {
 
         if(!line.empty()) {
             string processed_line = line_preprocessing(line);
-            
+
             if(processed_line == "section data") { // define que labels sao dados
                 current_section = 0;
                 line_counter++;
@@ -280,21 +300,53 @@ void first_pass(char* file_path) {
                     throw_error(ERROR_DUPLICATE_SYMBOL, line_counter, symb);
                 } else {
                     if(current_section == 0) { // section data
-                        temp_symbol_table[ tokens["label"] ] = data_pos_counter;
+                        // no section data sao declarados os public e extern
+                        if(tokens.count("instruction") && tokens["instruction"] == "extern") {
+                            symbol_table[ tokens["label"] ] = make_pair(0, 1);
+                        } else {
+                            temp_symbol_table[ tokens["label"] ] = make_pair(data_pos_counter, 0);
+                        }
                     } else {
-                        symbol_table[ tokens["label"] ] = pos_counter;
+                        symbol_table[ tokens["label"] ] = make_pair(pos_counter, 0);
                     }
                 }
 
             }
 
             if(tokens.count("instruction")) {
+                if(module_count == 1) {
+                    // se for apenas um modulo, nao deve ter begin ou end
+                    if(tokens["instruction"] == "begin" || tokens["instruction"] == "end") {
+                        string symb[1] = { tokens["instruction"] };
+                        throw_error(ERROR_BOUNDARIES_SINGLE_FILE, line_counter, symb);
+                        line_counter++; 
+                        continue;
+                    }
+                } else if(module_count >= 2) {
+                    // se tiver dois ou tres modulos, precisa ter begin e end
+                    if(tokens["instruction"] == "begin") {
+                        boundaries_defined[0] = 1;
+                    } else if(tokens["instruction"] == "end") {
+                        boundaries_defined[1] = 1;
+                    }
+
+                    // evita o erro de instrucao invalida
+                    if(tokens["instruction"] == "begin" || tokens["instruction"] == "end") {
+                        line_counter++;
+                        continue;
+                    }
+                }
+
                 if(instruction_table.count( tokens["instruction"] )) { // se existe instrucao
                     pos_counter = pos_counter + instruction_table[ tokens["instruction"] ].second;
                 } else {
                     if(directives_table.count( tokens["instruction"] )) { // se existe diretiva
                         if(current_section == 0) {
-                            data_pos_counter = data_pos_counter + directives_table[ tokens["instruction"] ];
+                            if(tokens["instruction"] == "public") {
+                                def_table[ tokens["params"] ] = make_pair(0,0);
+                            } else if(tokens["instruction"] != "extern") { // nao contar espaco do extern
+                                data_pos_counter = data_pos_counter + directives_table[ tokens["instruction"] ];
+                            }
                         } else {
                             pos_counter = pos_counter + directives_table[ tokens["instruction"] ];
                         }
@@ -312,7 +364,20 @@ void first_pass(char* file_path) {
     // adiciona elementos do data na tabela de simbolos,
     // ja considerando que vai estar no final
     for(auto &i : temp_symbol_table) {
-        symbol_table[ i.first ] = pos_counter + i.second;
+        symbol_table[ i.first ] = make_pair(pos_counter + i.second.first, i.second.second);
+    }
+
+    // copia atributos da tabela de simbolos para a tabela de definicoes
+    for(auto &i : def_table) {
+        def_table[ i.first ] = symbol_table[ i.first ];
+    }
+
+    // verifica se begin e end foram definidos, e se nao for (2 modulos+), gera erro
+    if(module_count >= 2) {
+        if(!boundaries_defined[0] || !boundaries_defined[1]) {
+            string symb[1] = {"uai"};
+            throw_error(ERROR_INVALID_MODULE, 0, symb);
+        }
     }
 
     file.close();
@@ -336,8 +401,8 @@ int line_elements(string line, int line_number, int pos_counter, vector<int> &ob
     if(elements.size() > 2) { // nenhuma instrucao/diretiva tem mais de 1 espaco (ignorando rotulo)
         if(directives_table.count(elements[0]) || instruction_table.count(elements[0])) {
             string qtd_args;
-            if(elements[0] == "const") qtd_args = "1";
-            else if(elements[0] == "space") qtd_args = "0";
+            if(elements[0] == "const" || elements[0] == "public") qtd_args = "1";
+            else if(elements[0] == "space" || elements[0] == "extern") qtd_args = "0";
             else if(elements[0] == "copy") qtd_args = "2, separados por virgula";
             else qtd_args = to_string(instruction_table[ elements[0] ].second - 1);
 
@@ -360,8 +425,12 @@ int line_elements(string line, int line_number, int pos_counter, vector<int> &ob
                 }
             } else if(elements.size() == 1 && elements[0] == "space") {
                 tmp_data.push_back(0);
+            } else if(elements.size() == 2 && elements[0] == "public") {
+                // tratar aqui o que a diretiva public vai fazer
+            } else if(elements.size() == 1 && elements[0] == "extern") {
+                // tratar aqui o que a diretiva extern vai fazer
             } else {
-                string qtd_args = (elements[0] == "const" ? "1" : "0");
+                string qtd_args = ( (elements[0] == "const" || elements[0] == "public") ? "1" : "0");
                 string symb[3] = { elements[0], to_string(elements.size() - 1), qtd_args };
                 throw_error(ERROR_INVALID_OPERATOR_COUNT, line_number, symb);
             }
@@ -385,10 +454,17 @@ int line_elements(string line, int line_number, int pos_counter, vector<int> &ob
                     // gera codigo obj
 
                     obj_code.push_back( instruction_table[ elements[0] ].first ); // opcode
+                    reloc_info.push_back(0);
 
                     for(string arg : args) {
                         if(symbol_table.count(arg)) {
-                            obj_code.push_back( symbol_table[arg] ); // operando
+                            if(symbol_table[arg].second == 0) { // interno
+                                obj_code.push_back( symbol_table[arg].first ); // operando
+                            } else { // externo
+                                obj_code.push_back(0);
+                                use_table.push_back(make_pair(arg, obj_code.size() - 1));
+                            }
+                            reloc_info.push_back(1);
                         }
                     }
 
@@ -401,12 +477,15 @@ int line_elements(string line, int line_number, int pos_counter, vector<int> &ob
                 if((instruction_table[ elements[0] ].second - 1) == 0) {
                     // gera codigo obj
                     obj_code.push_back( instruction_table[ elements[0] ].first ); // opcode
+                    reloc_info.push_back(0);
                     pos_counter = pos_counter + instruction_table[ elements[0] ].second;
                 } else { // caso de instrucao valida, mas sem argumentos
                     string symb[3] = { elements[0], "0", to_string( instruction_table[ elements[0] ].second - 1 ) };
                     throw_error(ERROR_INVALID_OPERATOR_COUNT, line_number, symb);
                 }
             }
+        } else if(elements[0] == "begin" || elements[0] == "end") {
+            // bom, faz nada
         } else {
             string symb[1] = { elements[0] };
             throw_error(ERROR_INEXISTENT_INSTRUCTION, line_number, symb);
@@ -444,6 +523,7 @@ vector<int> second_pass(char* file_path) {
     // adiciona secao de dados ao final do arquivo objeto
     for(auto &i : tmp_data) {
         obj_code.push_back(i);
+        reloc_info.push_back(0);
     }
 
     file.close();
@@ -455,30 +535,70 @@ int main(int argc, char* argv[]) {
     if(argc < 2) {
         cout << "Execute o programa especificando qual arquivo sera utilizado: ./montador programa.asm" << endl;
         return 0;
+    } else if(argc > 4) {
+        cout << "Sao permitidos apenas 3 modulos, no total. Execute novamente com um, dois, ou tres modulos." << endl;
+        return 0;
     }
 
-    char* file_path = argv[1];
+    module_count = argc - 1;
 
-    // separa nome do arquivo
-    string file_name = file_path;
-    size_t endf = file_name.find(".asm");
-    if(endf != string::npos)
-        file_name.erase(file_name.begin() + endf, file_name.end());
 
-    // primeira e segunda passagens
-    first_pass(file_path);
-    vector<int> obj_code = second_pass(file_path);
+    for(int i=0;i<module_count;i++) {
+        char* file_path = argv[1+i];
+        // separa nome do arquivo
+        string file_name = file_path;
+        size_t endf = file_name.find(".asm");
+        if(endf != string::npos)
+            file_name.erase(file_name.begin() + endf, file_name.end());
 
-    // se nao houver erros, escreve o arquivo objeto
-    if(!error_flag) {
-        ofstream binary;
-        binary.open(file_name + ".obj");
+        // primeira e segunda passagens
+        first_pass(file_path);
+        vector<int> obj_code = second_pass(file_path);
 
-        for(int &w : obj_code) {
-            binary << w << " ";
+
+        // se nao houver erros, escreve o arquivo objeto
+        if(!error_flag) {
+            // gera string de relocacao
+            stringstream rinfo;
+            for(int &i : reloc_info) {
+                rinfo << i;
+            }
+
+            ofstream binary;
+            binary.open(file_name + ".obj");
+
+            binary << "H " << file_name << endl;
+            binary << "S " << obj_code.size() << endl;
+            binary << "R " << rinfo.str() << endl;
+
+            // tabela de uso
+            for(auto &i : use_table) {
+                binary << "U " << i.first << " " << i.second << endl;
+            }
+
+            // tabela de definicao
+            for(auto &i : def_table) {
+                binary << "D " << i.first << " " << i.second.first << endl;
+            }
+
+            // texto
+            for(int i=0;i<obj_code.size();i++) {
+                if(reloc_info[i] == 0)
+                    binary << "T ";
+
+                binary << obj_code[i] << " ";
+
+                if(reloc_info[i+1] == 0)
+                    binary << endl;
+            }
+
+            binary.close();
         }
 
-        binary.close();
+        symbol_table.clear();
+        def_table.clear();
+        use_table.clear();
+        reloc_info.clear();
     }
 
     return 0;
